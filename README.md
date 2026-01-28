@@ -1,4 +1,4 @@
-# 🧠 Chat RAG AI: RAG Avançado com Persistência Gerenciada
+# 🧠 DocuChat AI: RAG Avançado com Persistência Gerenciada
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue?style=for-the-badge&logo=python&logoColor=white)
 ![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=streamlit&logoColor=white)
@@ -10,7 +10,9 @@
 ---
 
 ## 📸 Demonstração
-*(Cole aqui o print ou GIF da sua aplicação rodando)*
+<img width="1916" height="863" alt="image" src="https://github.com/user-attachments/assets/0734008f-d54f-4469-97b7-ef5eb62a2fac" />
+
+
 
 ## 🚀 Sobre o Projeto
 Este projeto não é apenas um wrapper da API da OpenAI. É uma implementação completa de uma arquitetura **RAG (Retrieval-Augmented Generation)** projetada para rodar localmente com robustez.
@@ -38,8 +40,8 @@ O diferencial deste projeto é o foco na **Engenharia de Software** por trás do
 ├── 📄 .env                # Variáveis de ambiente (API Keys)
 ├── 📄 .gitignore          # Configuração do Git
 └── 📂 .venv               # Ambiente virtual Python
-
-## 🧠 Desafios de Engenharia & Soluções
+```
+# 🧠 Desafios de Engenharia & Soluções
 
 ### O Problema: File Locking no Windows
 Durante o desenvolvimento, ao tentar deletar o banco de dados `ChromaDB` imediatamente após o uso, o Windows retornava erros de `PermissionError`, pois o processo do Python ainda mantinha o arquivo aberto (File Locking). Isso causava acúmulo de lixo no disco e falhas na aplicação.
@@ -56,7 +58,7 @@ Implementei um algoritmo de limpeza "preguiçosa" (`cleanup_old_sessions`). Ao i
 
 1. **Clone o repositório:**
    ```bash
-   git clone [https://github.com/SEU_USUARIO/chat-rag-ai.git](https://github.com/SEU_USUARIO/chat-rag-ai.git)
+   git clone [https://github.com/henriqueecss/chat-rag-ai.git](https://github.com/henriqueecss/chat-rag-ai.git)
    cd chat-rag-ai
 
 2. **Configure o Ambiente:**
@@ -69,10 +71,14 @@ Implementei um algoritmo de limpeza "preguiçosa" (`cleanup_old_sessions`). Ao i
    
    pip install -r requirements.txt
 
-3. **Configure as Chaves: Renomeie o .env.example para .env ou crie um novo na raiz do projeto:**
+3. **Configure as Chaves:**
+   
+   Renomeie o .env.example para .env ou crie um novo na raiz do projeto:
+   ```bash
     GROQ_API_KEY=gsk_sua_chave_aqui...
 
-4. **Execute:**
+5. **Execute:**
+   ```bash
     streamlit run app.py
 
 **🔮 Melhorias Futuras (Roadmap)**
@@ -82,3 +88,7 @@ Implementei um algoritmo de limpeza "preguiçosa" (`cleanup_old_sessions`). Ao i
 [ ] Adicionar persistência de histórico de chat em banco SQL.
 
 [ ] Containerização com Docker para deploy simplificado.
+
+----------------------------------------------------------------------------------------------------------
+
+**Desenvolvido por: Henrique Cesar**
