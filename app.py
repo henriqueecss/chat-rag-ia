@@ -16,7 +16,8 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.retrievers import BM25Retriever
-from langchain.retrievers import EnsembleRetriever
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_classic.chains import create_history_aware_retriever
 from sentence_transformers import CrossEncoder
 from langgraph.graph import StateGraph, END, START
 from dotenv import load_dotenv
