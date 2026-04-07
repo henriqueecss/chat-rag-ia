@@ -15,6 +15,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain.chains import create_history_aware_retriever
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
+from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
 
 # --- PAGE CONFIG ---
@@ -76,10 +77,15 @@ cleanup_old_sessions()
 def get_embedding_model():
     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-# #2: Cache LLM per model name — avoids recreating on every message
+# Keyed by (model_name, temperature) so changing either creates a fresh instance
 @st.cache_resource
-def get_llm(model_name: str):
-    return ChatGroq(temperature=0.2, model_name=model_name)
+def get_llm(model_name: str, temperature: float):
+    return ChatGroq(temperature=temperature, model_name=model_name)
+
+# #1: Cross-encoder reranker — downloaded once, reused across all queries
+@st.cache_resource
+def get_reranker():
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
 # --- PDF PROCESSING ---
@@ -125,25 +131,51 @@ def process_pdf(file_bytes, file_name, persist_dir):
             os.remove(tmp_path)
 
 
-# #3: Hybrid retriever — BM25 (keyword) + vector (semantic) via EnsembleRetriever
+# #2: Auto-summary — runs once per new file right after indexing
+def generate_summary(file_name, chunks, model_name, temperature):
+    sample = "\n\n".join([c.page_content for c in chunks[:6]])
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "Você é um assistente especializado em análise de documentos. "
+         "Crie resumos concisos e informativos em português do Brasil."),
+        ("human",
+         f"Faça um resumo executivo do documento **{file_name}** com base no trecho abaixo. "
+         f"Inclua: tema principal, pontos-chave e qualquer dado relevante encontrado.\n\n{sample}")
+    ])
+    llm = get_llm(model_name, temperature)
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({})
+
+
+# Hybrid retriever — BM25 (keyword) + vector MMR, fetches more candidates for reranking
 def build_retriever(persist_dir, all_chunks):
     embedding_model = get_embedding_model()
     vector_store = Chroma(persist_directory=persist_dir, embedding_function=embedding_model)
 
     vector_retriever = vector_store.as_retriever(
         search_type="mmr",
-        search_kwargs={"k": 4, "fetch_k": 10, "lambda_mult": 0.7}
+        # k=6 so reranker has more candidates to work with
+        search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.7}
     )
 
     if all_chunks:
         bm25_retriever = BM25Retriever.from_documents(all_chunks)
-        bm25_retriever.k = 4
+        bm25_retriever.k = 6
         return EnsembleRetriever(
             retrievers=[bm25_retriever, vector_retriever],
             weights=[0.4, 0.6]
         )
 
     return vector_retriever
+
+
+# #1: Rerank retrieved docs using cross-encoder scores, return top_n
+def rerank(query, docs, top_n=4):
+    reranker = get_reranker()
+    pairs = [(query, doc.page_content) for doc in docs]
+    scores = reranker.predict(pairs)
+    ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in ranked[:top_n]]
 
 
 # --- SESSION INIT ---
@@ -155,6 +187,8 @@ if "processed_files" not in st.session_state:
     st.session_state.processed_files = set()
 if "all_chunks" not in st.session_state:
     st.session_state.all_chunks = []
+if "summarized_files" not in st.session_state:
+    st.session_state.summarized_files = set()
 
 persist_dir = f"./chroma_db_{st.session_state.session_id}"
 
@@ -174,10 +208,16 @@ with st.sidebar:
         format_func=lambda x: "Llama 3.3 70B (Mais Inteligente)" if "70b" in x else "Llama 3.1 8B (Mais Rápido)"
     )
 
+    # #3: Temperature slider
+    temperature = st.slider(
+        "Temperatura:",
+        min_value=0.0, max_value=1.0, value=0.2, step=0.1,
+        help="0 = mais preciso e factual | 1 = mais criativo e exploratório"
+    )
+
     st.markdown("---")
     st.header("📂 Documentos")
 
-    # #4: Multiple PDF uploads
     uploaded_files = st.file_uploader(
         "Arraste seus PDFs aqui",
         type="pdf",
@@ -215,15 +255,33 @@ if uploaded_files:
     if new_files:
         with st.status(f"⚙️ Indexando {len(new_files)} documento(s)...", expanded=True) as status:
             all_ok = True
+            newly_indexed = []
+
             for f in new_files:
                 st.write(f"Processando: {f.name}...")
                 chunks = process_pdf(f.getvalue(), f.name, persist_dir)
                 if chunks is not None:
                     st.session_state.processed_files.add(f.name)
                     st.session_state.all_chunks.extend(chunks)
+                    newly_indexed.append((f.name, chunks))
                     st.write(f"✓ {f.name} — {len(chunks)} chunks indexados")
                 else:
                     all_ok = False
+
+            # #2: Auto-summary for each newly indexed file
+            if newly_indexed:
+                st.write("Gerando resumos...")
+                for file_name, chunks in newly_indexed:
+                    if file_name not in st.session_state.summarized_files:
+                        try:
+                            summary = generate_summary(file_name, chunks, model_option, temperature)
+                            st.session_state.messages.append({
+                                "role": "assistant",
+                                "content": f"**Resumo de _{file_name}_**\n\n{summary}"
+                            })
+                            st.session_state.summarized_files.add(file_name)
+                        except Exception as e:
+                            st.warning(f"Não foi possível gerar resumo para {file_name}: {e}")
 
             label = "✅ Tudo pronto! Pode perguntar." if all_ok else "⚠️ Alguns arquivos falharam."
             state = "complete" if all_ok else "error"
@@ -249,9 +307,7 @@ if prompt := st.chat_input("Ex: Qual o resumo executivo deste documento?"):
             full_response = ""
 
             try:
-                llm = get_llm(model_option)
-
-                # #3: Hybrid retriever (BM25 + vector)
+                llm = get_llm(model_option, temperature)
                 retriever = build_retriever(persist_dir, st.session_state.all_chunks)
 
                 # Build LangChain-format message history (last 6 messages = 3 exchanges)
@@ -262,8 +318,7 @@ if prompt := st.chat_input("Ex: Qual o resumo executivo deste documento?"):
                     else:
                         lc_history.append(AIMessage(content=m["content"]))
 
-                # #1: History-aware retriever — reformulates follow-up questions
-                # before hitting the retriever, so "explain the second point" works
+                # History-aware retriever — reformulates follow-up questions
                 contextualize_prompt = ChatPromptTemplate.from_messages([
                     ("system",
                      "Dado o histórico da conversa e a última pergunta do usuário, "
@@ -276,10 +331,13 @@ if prompt := st.chat_input("Ex: Qual o resumo executivo deste documento?"):
                     llm, retriever, contextualize_prompt
                 )
 
-                docs = history_aware_retriever.invoke({
+                # Retrieve candidates, then rerank to top 4
+                raw_docs = history_aware_retriever.invoke({
                     "input": prompt,
                     "chat_history": lc_history
                 })
+                docs = rerank(prompt, raw_docs, top_n=4)  # #1: reranking step
+
                 context_text = "\n\n".join([doc.page_content for doc in docs])
 
                 answer_prompt = ChatPromptTemplate.from_messages([
