@@ -24,6 +24,7 @@ O diferencial deste projeto é o foco na **Engenharia de Software** por trás do
 4.  **Busca Híbrida:** Combinação de BM25 (keyword) + busca vetorial via `EnsembleRetriever`, capturando tanto similaridade semântica quanto correspondências exatas de termos, nomes e datas.
 5.  **Recuperação Contextual:** Perguntas de acompanhamento ("explique o segundo ponto") são reformuladas em queries independentes antes de atingir o retriever, eliminando falhas silenciosas em conversas longas.
 6.  **Multi-documento:** Suporte a múltiplos PDFs simultâneos na mesma sessão, com rastreamento de fonte por chunk e exibição do arquivo de origem nas citações.
+7.  **Agente de Recuperação (LangGraph):** Pipeline de retrieval implementado como um grafo de estados com auto-correção — se o contexto recuperado for insuficiente, o agente reescreve a query automaticamente e tenta novamente.
 
 ## 🛠️ Arquitetura e Tech Stack
 
@@ -100,6 +101,8 @@ Implementei um algoritmo de limpeza "preguiçosa" (`cleanup_old_sessions`). Ao i
 [x] Resumo automático ao fazer upload de documento.
 
 [x] Controle de temperatura via interface.
+
+[x] Refatorar pipeline de retrieval com LangGraph (agente com auto-correção).
 
 [ ] Adicionar persistência de histórico de chat em banco SQL.
 

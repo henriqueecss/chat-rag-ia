@@ -4,18 +4,21 @@ import tempfile
 import uuid
 import shutil
 import time
+from typing import TypedDict, List, Literal
+
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.documents import Document
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.output_parsers import StrOutputParser
-from langchain.chains import create_history_aware_retriever
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever
 from sentence_transformers import CrossEncoder
+from langgraph.graph import StateGraph, END, START
 from dotenv import load_dotenv
 
 # --- PAGE CONFIG ---
@@ -77,12 +80,10 @@ cleanup_old_sessions()
 def get_embedding_model():
     return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-# Keyed by (model_name, temperature) so changing either creates a fresh instance
 @st.cache_resource
 def get_llm(model_name: str, temperature: float):
     return ChatGroq(temperature=temperature, model_name=model_name)
 
-# #1: Cross-encoder reranker — downloaded once, reused across all queries
 @st.cache_resource
 def get_reranker():
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
@@ -90,7 +91,6 @@ def get_reranker():
 
 # --- PDF PROCESSING ---
 def process_pdf(file_bytes, file_name, persist_dir):
-    """Load, split, embed and store a PDF. Returns the list of chunks."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(file_bytes)
         tmp_path = tmp_file.name
@@ -131,7 +131,6 @@ def process_pdf(file_bytes, file_name, persist_dir):
             os.remove(tmp_path)
 
 
-# #2: Auto-summary — runs once per new file right after indexing
 def generate_summary(file_name, chunks, model_name, temperature):
     sample = "\n\n".join([c.page_content for c in chunks[:6]])
     prompt = ChatPromptTemplate.from_messages([
@@ -142,19 +141,16 @@ def generate_summary(file_name, chunks, model_name, temperature):
          f"Faça um resumo executivo do documento **{file_name}** com base no trecho abaixo. "
          f"Inclua: tema principal, pontos-chave e qualquer dado relevante encontrado.\n\n{sample}")
     ])
-    llm = get_llm(model_name, temperature)
-    chain = prompt | llm | StrOutputParser()
+    chain = prompt | get_llm(model_name, temperature) | StrOutputParser()
     return chain.invoke({})
 
 
-# Hybrid retriever — BM25 (keyword) + vector MMR, fetches more candidates for reranking
-def build_retriever(persist_dir, all_chunks):
+def build_base_retriever(persist_dir, all_chunks):
     embedding_model = get_embedding_model()
     vector_store = Chroma(persist_directory=persist_dir, embedding_function=embedding_model)
 
     vector_retriever = vector_store.as_retriever(
         search_type="mmr",
-        # k=6 so reranker has more candidates to work with
         search_kwargs={"k": 6, "fetch_k": 20, "lambda_mult": 0.7}
     )
 
@@ -169,13 +165,119 @@ def build_retriever(persist_dir, all_chunks):
     return vector_retriever
 
 
-# #1: Rerank retrieved docs using cross-encoder scores, return top_n
 def rerank(query, docs, top_n=4):
     reranker = get_reranker()
     pairs = [(query, doc.page_content) for doc in docs]
     scores = reranker.predict(pairs)
     ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
     return [doc for _, doc in ranked[:top_n]]
+
+
+# ---------------------------------------------------------------------------
+# LANGGRAPH — Retrieval Agent
+# ---------------------------------------------------------------------------
+
+class RAGState(TypedDict):
+    question: str           # original user question
+    query: str              # current query (may be rewritten)
+    chat_history: list      # LangChain HumanMessage / AIMessage objects
+    documents: List[Document]
+    retries: int            # how many rewrite attempts so far
+
+
+def build_rag_graph(model_name: str, temperature: float, persist_dir: str, all_chunks: list):
+    """
+    Builds and compiles a LangGraph retrieval agent.
+
+    Graph flow:
+        contextualize → retrieve → rerank → grade
+                                              │
+                               "relevant" → END   (documents ready for answer)
+                               "rewrite"  → rewrite → retrieve (max 1 retry)
+    """
+    llm = get_llm(model_name, temperature)
+    retriever = build_base_retriever(persist_dir, all_chunks)
+
+    # Node 1: rewrite follow-up questions into standalone queries
+    def contextualize(state: RAGState) -> RAGState:
+        if not state["chat_history"]:
+            return {**state, "query": state["question"]}
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "Dado o histórico da conversa e a última pergunta do usuário, "
+             "reformule-a como uma questão independente. NÃO responda, apenas reformule."),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ])
+        chain = prompt | llm | StrOutputParser()
+        new_query = chain.invoke({"input": state["question"], "chat_history": state["chat_history"]})
+        return {**state, "query": new_query}
+
+    # Node 2: hybrid BM25 + vector retrieval
+    def retrieve(state: RAGState) -> RAGState:
+        docs = retriever.invoke(state["query"])
+        return {**state, "documents": docs}
+
+    # Node 3: cross-encoder reranking
+    def rerank_node(state: RAGState) -> RAGState:
+        docs = rerank(state["query"], state["documents"], top_n=4)
+        return {**state, "documents": docs}
+
+    # Node 4: rewrite the query differently if context was insufficient
+    def rewrite_query(state: RAGState) -> RAGState:
+        prompt = ChatPromptTemplate.from_template(
+            "A busca pela pergunta '{question}' não retornou contexto suficiente. "
+            "Reformule-a de forma diferente para melhorar a recuperação, "
+            "mantendo o mesmo objetivo. Retorne apenas a nova pergunta."
+        )
+        chain = prompt | llm | StrOutputParser()
+        new_query = chain.invoke({"question": state["query"]})
+        return {**state, "query": new_query, "retries": state["retries"] + 1}
+
+    # Conditional edge: grade whether retrieved docs are relevant enough
+    def grade_documents(state: RAGState) -> Literal["generate", "rewrite"]:
+        # After 1 retry, proceed regardless to avoid infinite loops
+        if state["retries"] >= 1:
+            return "generate"
+
+        grader_prompt = ChatPromptTemplate.from_template(
+            "Pergunta: {question}\n\n"
+            "Trecho do documento:\n{document}\n\n"
+            "Este trecho contém informação útil para responder a pergunta? "
+            "Responda apenas 'sim' ou 'não'."
+        )
+        grader = grader_prompt | llm | StrOutputParser()
+
+        for doc in state["documents"]:
+            result = grader.invoke({
+                "question": state["query"],
+                "document": doc.page_content[:500]
+            })
+            if "sim" in result.lower():
+                return "generate"
+
+        return "rewrite"
+
+    # Build the graph
+    graph = StateGraph(RAGState)
+
+    graph.add_node("contextualize", contextualize)
+    graph.add_node("retrieve", retrieve)
+    graph.add_node("rerank", rerank_node)
+    graph.add_node("rewrite", rewrite_query)
+
+    graph.add_edge(START, "contextualize")
+    graph.add_edge("contextualize", "retrieve")
+    graph.add_edge("retrieve", "rerank")
+    graph.add_conditional_edges(
+        "rerank",
+        grade_documents,
+        {"generate": END, "rewrite": "rewrite"}
+    )
+    graph.add_edge("rewrite", "retrieve")
+
+    return graph.compile()
 
 
 # --- SESSION INIT ---
@@ -208,7 +310,6 @@ with st.sidebar:
         format_func=lambda x: "Llama 3.3 70B (Mais Inteligente)" if "70b" in x else "Llama 3.1 8B (Mais Rápido)"
     )
 
-    # #3: Temperature slider
     temperature = st.slider(
         "Temperatura:",
         min_value=0.0, max_value=1.0, value=0.2, step=0.1,
@@ -268,7 +369,6 @@ if uploaded_files:
                 else:
                     all_ok = False
 
-            # #2: Auto-summary for each newly indexed file
             if newly_indexed:
                 st.write("Gerando resumos...")
                 for file_name, chunks in newly_indexed:
@@ -284,8 +384,7 @@ if uploaded_files:
                             st.warning(f"Não foi possível gerar resumo para {file_name}: {e}")
 
             label = "✅ Tudo pronto! Pode perguntar." if all_ok else "⚠️ Alguns arquivos falharam."
-            state = "complete" if all_ok else "error"
-            status.update(label=label, state=state, expanded=False)
+            status.update(label=label, state="complete" if all_ok else "error", expanded=False)
 
 has_documents = bool(st.session_state.processed_files)
 
@@ -303,14 +402,12 @@ if prompt := st.chat_input("Ex: Qual o resumo executivo deste documento?"):
 
     if has_documents:
         with st.chat_message("assistant", avatar="🤖"):
+            status_placeholder = st.empty()
             response_placeholder = st.empty()
             full_response = ""
 
             try:
-                llm = get_llm(model_option, temperature)
-                retriever = build_retriever(persist_dir, st.session_state.all_chunks)
-
-                # Build LangChain-format message history (last 6 messages = 3 exchanges)
+                # Build LangChain-format message history (last 6 = 3 exchanges)
                 lc_history = []
                 for m in st.session_state.messages[:-1][-6:]:
                     if m["role"] == "user":
@@ -318,28 +415,44 @@ if prompt := st.chat_input("Ex: Qual o resumo executivo deste documento?"):
                     else:
                         lc_history.append(AIMessage(content=m["content"]))
 
-                # History-aware retriever — reformulates follow-up questions
-                contextualize_prompt = ChatPromptTemplate.from_messages([
-                    ("system",
-                     "Dado o histórico da conversa e a última pergunta do usuário, "
-                     "reformule a pergunta como uma questão independente que possa ser entendida "
-                     "sem o histórico. NÃO responda a pergunta, apenas reformule-a se necessário."),
-                    MessagesPlaceholder("chat_history"),
-                    ("human", "{input}"),
-                ])
-                history_aware_retriever = create_history_aware_retriever(
-                    llm, retriever, contextualize_prompt
+                # --- Run the LangGraph retrieval agent ---
+                rag_graph = build_rag_graph(
+                    model_option, temperature, persist_dir, st.session_state.all_chunks
                 )
 
-                # Retrieve candidates, then rerank to top 4
-                raw_docs = history_aware_retriever.invoke({
-                    "input": prompt,
-                    "chat_history": lc_history
-                })
-                docs = rerank(prompt, raw_docs, top_n=4)  # #1: reranking step
+                initial_state: RAGState = {
+                    "question": prompt,
+                    "query": prompt,
+                    "chat_history": lc_history,
+                    "documents": [],
+                    "retries": 0,
+                }
 
+                # Stream graph updates so user sees what's happening
+                final_state = initial_state
+                for update in rag_graph.stream(initial_state, stream_mode="updates"):
+                    node_name = next(iter(update))
+                    node_state = update[node_name]
+
+                    if node_name == "contextualize" and node_state.get("query") != prompt:
+                        status_placeholder.caption(f"🔎 Query reformulada: _{node_state['query']}_")
+                    elif node_name == "rewrite":
+                        status_placeholder.warning(
+                            f"⚠️ Contexto insuficiente. Reformulando query para: _{node_state.get('query', '')}_"
+                        )
+                    elif node_name == "rerank":
+                        status_placeholder.caption(
+                            f"✅ {len(node_state.get('documents', []))} chunks selecionados pelo reranker"
+                        )
+
+                    final_state = {**final_state, **node_state}
+
+                status_placeholder.empty()
+
+                docs = final_state["documents"]
                 context_text = "\n\n".join([doc.page_content for doc in docs])
 
+                # --- Stream the final answer with LCEL ---
                 answer_prompt = ChatPromptTemplate.from_messages([
                     ("system",
                      "Você é um assistente profissional analisando documentos. "
@@ -350,11 +463,11 @@ if prompt := st.chat_input("Ex: Qual o resumo executivo deste documento?"):
                     ("human", "{input}"),
                 ])
 
-                chain = answer_prompt | llm | StrOutputParser()
+                chain = answer_prompt | get_llm(model_option, temperature) | StrOutputParser()
 
                 for chunk in chain.stream({
                     "context": context_text,
-                    "input": prompt,
+                    "input": final_state["query"],
                     "chat_history": lc_history
                 }):
                     full_response += chunk
