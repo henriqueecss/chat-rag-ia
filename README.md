@@ -21,6 +21,9 @@ O diferencial deste projeto é o foco na **Engenharia de Software** por trás do
 1.  **Isolamento de Sessão:** Cada documento carregado cria um banco vetorial único (hash UUID), impedindo que dados de usuários diferentes se misturem (*Context Poisoning*).
 2.  **Gerenciamento de Recursos:** Implementação de um *Garbage Collector* customizado para lidar com arquivos temporários que o Windows bloqueia (*File Locking*), limpando o disco automaticamente no boot.
 3.  **UX Profissional:** Interface com feedback de carregamento, streaming de respostas, alternância de modelos (Llama 70B vs 8B) e citação de fontes.
+4.  **Busca Híbrida:** Combinação de BM25 (keyword) + busca vetorial via `EnsembleRetriever`, capturando tanto similaridade semântica quanto correspondências exatas de termos, nomes e datas.
+5.  **Recuperação Contextual:** Perguntas de acompanhamento ("explique o segundo ponto") são reformuladas em queries independentes antes de atingir o retriever, eliminando falhas silenciosas em conversas longas.
+6.  **Multi-documento:** Suporte a múltiplos PDFs simultâneos na mesma sessão, com rastreamento de fonte por chunk e exibição do arquivo de origem nas citações.
 
 ## 🛠️ Arquitetura e Tech Stack
 
@@ -30,6 +33,7 @@ O diferencial deste projeto é o foco na **Engenharia de Software** por trás do
 | **Orquestração** | LangChain (LCEL) | Pipelines de processamento de texto e conexão com LLM. |
 | **Vector Store** | ChromaDB | Banco de dados vetorial persistente em disco. |
 | **Embeddings** | HuggingFace | Modelo `all-MiniLM-L6-v2` (rápido e eficiente para CPU). |
+| **Retrieval** | BM25 + ChromaDB MMR | Busca híbrida: keywords (BM25, 40%) + semântica vetorial (60%). |
 | **Inference** | Groq API | Acesso ultra-rápido ao modelo **Llama 3.3 70B**. |
 
 ## 📂 Estrutura do Projeto
@@ -70,6 +74,7 @@ Implementei um algoritmo de limpeza "preguiçosa" (`cleanup_old_sessions`). Ao i
    .venv\Scripts\activate
    
    pip install -r requirements.txt
+   pip install rank_bm25
 
 3. **Configure as Chaves:**
    
@@ -83,7 +88,11 @@ Implementei um algoritmo de limpeza "preguiçosa" (`cleanup_old_sessions`). Ao i
 
 **🔮 Melhorias Futuras (Roadmap)**
 
-[ ] Implementar suporte para múltiplos arquivos PDF simultâneos.
+[x] Implementar suporte para múltiplos arquivos PDF simultâneos.
+
+[x] Busca híbrida (BM25 + vetorial) com EnsembleRetriever.
+
+[x] Recuperação contextual com reformulação de perguntas (history-aware retriever).
 
 [ ] Adicionar persistência de histórico de chat em banco SQL.
 
